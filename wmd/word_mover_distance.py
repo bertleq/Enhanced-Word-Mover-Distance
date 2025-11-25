@@ -33,7 +33,8 @@ class WordMoverDistance:
         addition_penalty: float = 1.0,
         use_pretrained_embeddings: bool = True,
         embedding_model: str = 'all-MiniLM-L6-v2',
-        perturbation_penalty_weight: float = 0.0
+        perturbation_penalty_weight: float = 0.0,
+        idf_dict: Dict[str, float] = None
     ):
         """
         Initialize WMD calculator.
@@ -44,11 +45,13 @@ class WordMoverDistance:
             use_pretrained_embeddings: Whether to use pretrained embeddings
             embedding_model: Name of the sentence-transformers model to use
             perturbation_penalty_weight: Weight for perturbation penalty (0 to disable)
+            idf_dict: Dictionary mapping words to IDF weights. If None, uniform weights are used.
         """
         self.deletion_penalty = deletion_penalty
         self.addition_penalty = addition_penalty
         self.use_pretrained_embeddings = use_pretrained_embeddings
         self.perturbation_penalty_weight = perturbation_penalty_weight
+        self.idf_dict = idf_dict or {}
         
         if use_pretrained_embeddings and SENTENCE_TRANSFORMERS_AVAILABLE:
             self.embedder = SentenceTransformer(embedding_model)
@@ -56,6 +59,38 @@ class WordMoverDistance:
         else:
             self.embedder = None
             self.embedding_dim = 100  # Default dimension for simple embeddings
+
+    def fit(self, corpus: List[str]):
+        """
+        Compute IDF weights from a corpus.
+        
+        Args:
+            corpus: List of documents (strings)
+        """
+        doc_count = len(corpus)
+        word_doc_counts = Counter()
+        
+        for doc in corpus:
+            # Use set to count each word only once per document
+            words = set(doc.lower().split())
+            word_doc_counts.update(words)
+            
+        self.idf_dict = {}
+        for word, count in word_doc_counts.items():
+            # Standard IDF formula: log(N / (1 + df)) + 1
+            self.idf_dict[word] = np.log(doc_count / (1 + count)) + 1.0
+            
+    def _get_idf_weight(self, ngram: str) -> float:
+        """
+        Get IDF weight for an n-gram.
+        For n-grams (n>1), we take the average IDF of constituent words.
+        """
+        if not self.idf_dict:
+            return 1.0
+            
+        words = ngram.split()
+        weights = [self.idf_dict.get(w, 1.0) for w in words]
+        return sum(weights) / len(weights) if weights else 1.0
             
     def _extract_ngrams(self, text: str, n: int) -> List[str]:
         """
@@ -173,12 +208,16 @@ class WordMoverDistance:
         
         # Expand based on frequencies
         expanded_ng1_list = []
+        weights1 = []
         for ng1, count1 in counts1.items():
             expanded_ng1_list.extend([ng1] * count1)
+            weights1.extend([self._get_idf_weight(ng1)] * count1)
         
         expanded_ng2_list = []
+        weights2 = []
         for ng2, count2 in counts2.items():
             expanded_ng2_list.extend([ng2] * count2)
+            weights2.extend([self._get_idf_weight(ng2)] * count2)
         
         total_n1 = len(expanded_ng1_list)
         total_n2 = len(expanded_ng2_list)
@@ -189,25 +228,22 @@ class WordMoverDistance:
         cost_matrix = np.zeros((max_size, max_size))
         
         # Fill the actual distances
-        for i in range(min(total_n1, total_n2)):
-            ng1 = expanded_ng1_list[i] if i < total_n1 else None
-            for j in range(min(total_n1, total_n2)):
-                ng2 = expanded_ng2_list[j] if j < total_n2 else None
-                if ng1 is not None and ng2 is not None:
-                    cost_matrix[i, j] = dist_matrix[idx_map1[ng1], idx_map2[ng2]]
-        
-        # For all positions, fill complete cost matrix
         for i in range(max_size):
             for j in range(max_size):
                 if i < total_n1 and j < total_n2:
                     # Actual matching cost
-                    cost_matrix[i, j] = dist_matrix[idx_map1[expanded_ng1_list[i]], idx_map2[expanded_ng2_list[j]]]
+                    dist = dist_matrix[idx_map1[expanded_ng1_list[i]], idx_map2[expanded_ng2_list[j]]]
+                    # Weight the distance by the average importance of the two terms
+                    weight = (weights1[i] + weights2[j]) / 2
+                    cost_matrix[i, j] = dist * weight
                 elif i < total_n1 and j >= total_n2:
                     # Deletion: item from text1 not matched
-                    cost_matrix[i, j] = self.deletion_penalty
+                    # Cost is penalty * weight of the deleted item
+                    cost_matrix[i, j] = self.deletion_penalty * weights1[i]
                 elif i >= total_n1 and j < total_n2:
                     # Addition: item from text2 not matched
-                    cost_matrix[i, j] = self.addition_penalty
+                    # Cost is penalty * weight of the added item
+                    cost_matrix[i, j] = self.addition_penalty * weights2[j]
                 # else: both are dummy (i >= total_n1 and j >= total_n2), leave as 0
         
         # Solve the linear assignment problem
@@ -216,8 +252,18 @@ class WordMoverDistance:
         # Calculate total cost
         total_cost = cost_matrix[row_ind, col_ind].sum()
         
-        # Normalize by the number of n-grams
-        normalized_cost = total_cost / max(total_n1, total_n2, 1)
+        # Normalize by the sum of weights of the larger text (approximation)
+        # Ideally we normalize by the total weight of the matched + deleted/added items
+        # But since we solve a square assignment, we can sum the weights of all involved items
+        # Actually, WMD is usually normalized by the number of words.
+        # With weights, we should normalize by the total weight.
+        
+        # Let's normalize by the max total weight to keep it bounded
+        total_weight1 = sum(weights1)
+        total_weight2 = sum(weights2)
+        normalization_factor = max(total_weight1, total_weight2, 1.0)
+        
+        normalized_cost = total_cost / normalization_factor
         
         return normalized_cost
     
@@ -312,6 +358,9 @@ class WordMoverDistance:
         Returns:
             Minimum WMD across all n-gram combinations (or dict if return_all_scores=True)
         """
+        if self.idf_dict is None:
+            self.idf_dict = self.fit([text1, text2])
+        
         scores = {}
         
         for n in n_values:
